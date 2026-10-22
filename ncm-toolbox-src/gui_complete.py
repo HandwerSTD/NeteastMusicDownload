@@ -31,6 +31,7 @@ from gui_common import (
     C_MUTED,
     C_OK,
     C_WARN,
+    DARK_UI,
     IDLE_POLL_MS,
     append_log,
     apply_cookie,
@@ -63,6 +64,38 @@ SEARCH_URL = 'https://music.163.com/api/cloudsearch/pc'
 
 MODE_ALBUM = 'album'
 MODE_ARTIST = 'artist'
+
+# ---------------------------------------------------------------- 勾选图标
+# 微软雅黑（本机 UI 字体）里没有 ☑ U+2611 / ☐ U+2610 / ✓ U+2713，实测三者
+# 渲染出来的墨迹和 notdef 完全一致，也就是豆腐块。所以不用文字符号，改用
+# Pillow 现画 RGBA 图标挂到 Treeview 的行首（实测 alpha 通道会被尊重，
+# 透明底在选中行高亮上也不会露出方块）。Pillow 是 gui_login 已在用的可选
+# 依赖，真缺了就退回纯文字标记，功能不受影响。
+_CHECK_CACHE = {}
+
+
+def _check_icon(checked, size, dark):
+    """画一个复选框图标；同一个 (状态, 尺寸, 主题) 只画一次"""
+    key = (bool(checked), int(size), bool(dark))
+    hit = _CHECK_CACHE.get(key)
+    if hit is not None:
+        return hit
+    from PIL import Image, ImageDraw, ImageTk
+    img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    lw = max(2, int(round(size / 8.0)))
+    box = [lw // 2, lw // 2, size - 1 - lw // 2, size - 1 - lw // 2]
+    if checked:
+        d.rectangle(box, fill='#8ab4f8' if dark else '#1a73e8')
+        d.line([(size * 0.26, size * 0.52), (size * 0.43, size * 0.71),
+                (size * 0.75, size * 0.31)],
+               fill='#10161f' if dark else '#ffffff',
+               width=max(2, int(round(size / 7.0))))
+    else:
+        d.rectangle(box, outline='#6b7280' if dark else '#9aa0a6', width=lw)
+    photo = ImageTk.PhotoImage(img)
+    _CHECK_CACHE[key] = photo
+    return photo
 
 STATE_LABEL = {
     'idle': '待解析',
@@ -379,16 +412,16 @@ class CompleteTab(ttk.Frame):
 
         self.targets = []          # 当前模式下的全部目标
         self._catalog = None       # 最近一次扫描的结果（切模式时复用，不必重读标签）
-        self._sel = set()          # 选中的 key（跨过滤、跨排序保持）
+        self._sel = set()          # 勾选的 key（跨过滤、跨排序保持）
+        self._anchor = None        # Shift 连选的锚点
         self._visible = []         # 当前过滤后的目标（未按 RENDER_CAP 截断）
-        self._rendering = False    # 重建列表时抑制 <<TreeviewSelect>>
         self._sort = ('name', True)
         self.mode = MODE_ALBUM
 
         self._build_ui()
         self.after(120, self._drain)
         self.log('补完模式：先「扫描音乐库」把专辑/歌手列出来，选好目标再「解析并加入队列」。')
-        self.log('提示：列表支持 Shift 连选、Ctrl 点选、Ctrl+A 全选，搜索框里输入关键词即时过滤。')
+        self.log('提示：点一行勾选一行，Shift 连点可勾选一段，Ctrl+A 全选，搜索框里输入关键词即时过滤。')
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -450,7 +483,15 @@ class CompleteTab(ttk.Frame):
         wrap = ttk.Frame(mid)
         wrap.pack(fill='both', expand=True, padx=8, pady=(0, 8))
         self.tree = ttk.Treeview(wrap, columns=[c[0] for c in self.COLUMNS],
-                                 show='headings', height=10, selectmode='extended')
+                                 show='tree headings', height=10, selectmode='none')
+        # 第 0 列空出来放复选框图标。选不选中完全由我们自己管：Treeview 原生
+        # 的 extended 多选很容易误触（点一下空白整片选择就没了、拖动一下全变），
+        # 换成「点哪行勾哪行」。
+        self._icon_px = self._pick_icon_size()
+        self._icon_ok = True
+        self.tree.heading('#0', text='')
+        self.tree.column('#0', width=self._icon_px + 20,
+                         minwidth=self._icon_px + 20, stretch=False, anchor='center')
         for c, t, w in self.COLUMNS:
             self.tree.heading(c, text=t, command=lambda k=c: self.on_sort(k))
             self.tree.column(c, width=w, anchor='w',
@@ -465,9 +506,8 @@ class CompleteTab(ttk.Frame):
         self.tree.tag_configure('fail', foreground=C_BAD)
         self.tree.tag_configure('warn', foreground=C_WARN)
         self.tree.tag_configure('run', foreground=C_INFO)
-        # Treeview 的 extended 模式自带 Shift 连选 / Ctrl 点选，这里只负责把
-        # 最终选择状态记到 _sel，重建列表（过滤、排序）时再照着恢复。
-        self.tree.bind('<<TreeviewSelect>>', self._on_tree_select)
+        self.tree.bind('<Button-1>', self._on_click)
+        self.tree.bind('<space>', self._on_space)
         self.tree.bind('<Control-a>', self._on_ctrl_a)
 
         # ---------------- ③ 操作 ----------------
@@ -657,22 +697,14 @@ class CompleteTab(ttk.Frame):
         self._visible = self._filtered()
         shown = self._visible[:RENDER_CAP]
 
-        self._rendering = True
-        try:
-            for iid in self.tree.get_children():
-                self.tree.delete(iid)
-            for t in shown:
-                if not self.tree.exists(t.key):
-                    self.tree.insert('', 'end', iid=t.key,
-                                     values=(t.name, t.artist, t.have or '',
-                                             t.total or '', t.state_text()),
-                                     tags=(t.state_tag(),))
-            # 恢复选择：只有当前画出来的行能设，别的最多留在 _sel 里
-            want = [t.key for t in shown if t.key in self._sel]
-            if want:
-                self.tree.selection_set(want)
-        finally:
-            self._rendering = False
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        for t in shown:
+            self.tree.insert('', 'end', iid=t.key,
+                             image=self._icon_for(t.key in self._sel),
+                             values=(t.name, t.artist, t.have or '',
+                                     t.total or '', t.state_text()),
+                             tags=(t.state_tag(),))
         self._update_counts()
 
     def _update_counts(self):
@@ -691,15 +723,66 @@ class CompleteTab(ttk.Frame):
         self.lbl_sel.configure(text='已选 %d 项' % n,
                                foreground=C_INFO if n else C_MUTED)
 
-    def _on_tree_select(self, _event=None):
-        if self._rendering:
+    def _pick_icon_size(self):
+        """按屏幕 DPI 算图标像素尺寸 —— 程序开了 DPI 感知，写死 16 会偏小"""
+        try:
+            dpi = float(self.winfo_fpixels('1i'))
+        except Exception:
+            dpi = 96.0
+        return max(14, int(round(16.0 * dpi / 96.0)))
+
+    def _icon_for(self, checked):
+        if not self._icon_ok:
+            return ''
+        try:
+            return _check_icon(checked, self._icon_px, DARK_UI)
+        except Exception:
+            self._icon_ok = False       # Pillow 缺失或 Tk 图片出错：退回无图标
+            return ''
+
+    def _paint_row(self, key):
+        """只改一行的勾选图标，不重建整张表"""
+        if self.tree.exists(key):
+            self.tree.item(key, image=self._icon_for(key in self._sel))
+
+    def _set_rows(self, keys, want):
+        for k in keys:
+            if want:
+                self._sel.add(k)
+            else:
+                self._sel.discard(k)
+            self._paint_row(k)
+
+    def _on_click(self, event):
+        region = self.tree.identify_region(event.x, event.y)
+        if region not in ('tree', 'cell'):
+            return                  # 表头交给排序，分隔线不管
+        row = self.tree.identify_row(event.y)
+        if not row:
             return
-        shown = set(self.tree.get_children())
-        picked = set(self.tree.selection())
-        # 只更新当前画出来的那部分；被过滤掉的选择原样保留
-        self._sel -= shown
-        self._sel |= picked
+        vis = list(self.tree.get_children())
+        want = row not in self._sel         # 以点中这一行为准
+        if (event.state & 0x0001) and self._anchor in vis:
+            i0, i1 = vis.index(self._anchor), vis.index(row)
+            if i0 > i1:
+                i0, i1 = i1, i0
+            self._set_rows(vis[i0:i1 + 1], want)
+        else:
+            self._set_rows([row], want)
+        self._anchor = row
+        try:
+            self.tree.focus(row)        # 让空格键作用于刚点的那行
+        except Exception:
+            pass
         self._update_sel_label()
+        return 'break'
+
+    def _on_space(self, _event=None):
+        row = self.tree.focus()
+        if row:
+            self._set_rows([row], row not in self._sel)
+            self._update_sel_label()
+        return 'break'
 
     def _on_ctrl_a(self, _event=None):
         self.on_select_all()
